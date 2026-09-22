@@ -1,8 +1,8 @@
 -- ============================================================
--- PRODIGY MACRO — Standalone Build v5
--- Remote-fire ONLY. No SendKeyEvent. No UI shift possible.
--- If a tool's remote can't be found, block skips (optionally
--- falls back to keys when Compatibility Mode is ON).
+-- PRODIGY MACRO — Standalone Build v6
+-- Remote-fire ONLY. Cobalt-dump shape from real Blox Fruits.
+-- Channel priority: Humanoid[""] (ability) > tool remote.
+-- Payload priority: (key, true) first.
 -- ============================================================
 
 local Players = game:GetService("Players")
@@ -37,7 +37,7 @@ local KEY_MAP = {
 local MacroEnabled = false
 local MacroRunning = false
 local MacroThread = nil
-local CompatibilityMode = false  -- when true, key fallback allowed (shifts UI)
+local CompatibilityMode = false
 
 local Blocks = {}
 for i = 1, 8 do
@@ -94,7 +94,6 @@ loadConfig()
 -- ABILITY FIRING — REMOTE ONLY
 -- ============================================================
 local function sendKeyRaw(keyCode, down)
-    -- Only used in compatibility fallback. Never called otherwise.
     if not VirtualInputManager then return end
     pcall(function()
         VirtualInputManager:SendKeyEvent(down, keyCode, false, game)
@@ -102,12 +101,88 @@ local function sendKeyRaw(keyCode, down)
 end
 
 local function releaseAllKeys()
-    -- No-op in pure remote mode. Kept for compat cleanup.
     if not CompatibilityMode then return end
     for _, kc in pairs(KEY_MAP) do sendKeyRaw(kc, false) end
 end
 
--- ---- Remote discovery ----
+-- Try a payload shape against a remote (auto-routes InvokeServer vs FireServer).
+local function attempt(remote, args)
+    if not remote then return false end
+    -- strip trailing nils
+    local clean = {}
+    for i = 1, #args do
+        if args[i] ~= nil then clean[#clean + 1] = args[i] end
+    end
+    local ok = pcall(function()
+        if remote:IsA("RemoteFunction") then
+            remote:InvokeServer(table.unpack(clean))
+        else
+            remote:FireServer(table.unpack(clean))
+        end
+    end)
+    return ok
+end
+
+-- Blox Fruits ability channel: Humanoid[""] RemoteFunction (or RemoteEvent).
+-- Signature from Cobalt dump: (abilityKey, true)
+local function fireOnHumanoid(abilityKey, holdSeconds)
+    local char = player.Character
+    if not char then return false end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not hum then return false end
+
+    local remote = hum:FindFirstChild("")
+    if not remote then
+        for _, c in ipairs(hum:GetChildren()) do
+            if c.Name == "" and (c:IsA("RemoteFunction") or c:IsA("RemoteEvent")) then
+                remote = c
+                break
+            end
+        end
+    end
+    if not remote then return false end
+
+    local myRoot = char:FindFirstChild("HumanoidRootPart")
+    local pos = myRoot and myRoot.Position or Vector3.zero
+    local targetPart = _G.currentSilentAimTarget
+    local targetRoot = targetPart and targetPart.Parent
+        and targetPart.Parent:FindFirstChild("HumanoidRootPart")
+
+    -- Shape priority from real dumps:
+    --  1. (key, true)                        -- fruit / combat primary
+    --  2. (key)                              -- some melee
+    --  3. (key, pos, targetRoot)             -- Buddy Sword / positional
+    --  4. (key, true, targetRoot)            -- alt variant
+    --  5. (key, pos)
+    --  6. (key, targetRoot)
+    local payloads = {
+        {abilityKey, true},
+        {abilityKey},
+        {abilityKey, pos, targetRoot},
+        {abilityKey, true, targetRoot},
+        {abilityKey, pos},
+        {abilityKey, targetRoot},
+    }
+
+    for _, args in ipairs(payloads) do
+        if attempt(remote, args) then
+            if holdSeconds and holdSeconds > 0 then
+                task.wait(holdSeconds)
+                pcall(function()
+                    if remote:IsA("RemoteFunction") then
+                        remote:InvokeServer(abilityKey, false)
+                    else
+                        remote:FireServer(abilityKey, false)
+                    end
+                end)
+            end
+            return true
+        end
+    end
+    return false
+end
+
+-- Fallback: some tools carry their ability remote directly.
 local REMOTE_NAMES = {
     "RemoteEvent", "", "Remote", "AbilityRemote", "CommE",
     "Skill", "Attack", "Use", "Server", "Event", "Fire"
@@ -115,130 +190,92 @@ local REMOTE_NAMES = {
 
 local function findRemoteIn(container)
     if not container then return nil end
-    -- named first
     for _, name in ipairs(REMOTE_NAMES) do
         local child = container:FindFirstChild(name)
         if child and (child:IsA("RemoteEvent") or child:IsA("RemoteFunction")) then
             return child
         end
     end
-    -- any remote child
     for _, child in ipairs(container:GetChildren()) do
         if child:IsA("RemoteEvent") or child:IsA("RemoteFunction") then
             return child
         end
     end
-    -- one level deep (some tools nest under a Folder)
-    for _, child in ipairs(container:GetChildren()) do
-        if child:IsA("Folder") or child:IsA("Model") then
-            for _, sub in ipairs(child:GetChildren()) do
-                if sub:IsA("RemoteEvent") or sub:IsA("RemoteFunction") then
-                    return sub
-                end
-            end
-        end
-    end
     return nil
 end
 
--- Tries multiple payload shapes for a given remote + key.
-local function tryFire(remote, abilityKey)
+local function fireOnTool(abilityKey, holdSeconds)
     local char = player.Character
     if not char then return false end
+    local tool = char:FindFirstChildOfClass("Tool")
+    if not tool then return false end
+
+    local remote = findRemoteIn(tool)
+    if not remote then return false end
+
     local myRoot = char:FindFirstChild("HumanoidRootPart")
+    local pos = myRoot and myRoot.Position or Vector3.zero
     local targetPart = _G.currentSilentAimTarget
     local targetRoot = targetPart and targetPart.Parent
         and targetPart.Parent:FindFirstChild("HumanoidRootPart")
-    local pos = myRoot and myRoot.Position or Vector3.zero
 
-    local attempts = {
-        -- Fruit style: just the key
+    -- The tool's "RemoteEvent" is the equip/unequip channel for fruits.
+    -- Firing (true) equips — that path is separate.
+    -- For tool-specific abilities, try the common ability shapes.
+    local payloads = {
+        {abilityKey, true},
         {abilityKey},
-        -- Combat/Sword style: key + position + target
         {abilityKey, pos, targetRoot},
-        -- Some fruits want the target only
-        {abilityKey, targetRoot},
-        -- Some want position only
         {abilityKey, pos},
     }
 
-    for _, args in ipairs(attempts) do
-        -- strip trailing nil
-        while #args > 0 and args[#args] == nil do
-            table.remove(args)
-        end
-        local ok = pcall(function()
-            if remote:IsA("RemoteFunction") then
-                remote:InvokeServer(unpack(args))
-            else
-                remote:FireServer(unpack(args))
+    for _, args in ipairs(payloads) do
+        if attempt(remote, args) then
+            if holdSeconds and holdSeconds > 0 then
+                task.wait(holdSeconds)
+                pcall(function() remote:FireServer(abilityKey, false) end)
             end
-        end)
-        if ok then return true end
+            return true
+        end
     end
     return false
 end
 
 local function fireAbilityRemote(abilityKey, holdSeconds)
-    local char = player.Character
-    if not char then return false end
-
-    -- 1. Try tool remote
-    local tool = char:FindFirstChildOfClass("Tool")
-    if tool then
-        local r = findRemoteIn(tool)
-        if r then
-            if tryFire(r, abilityKey) then
-                if holdSeconds and holdSeconds > 0 then
-                    task.wait(holdSeconds)
-                    pcall(function() r:FireServer(abilityKey, false) end)
-                end
-                return true
-            end
-        end
-    end
-
-    -- 2. Try humanoid remote (Combat / sword abilities)
-    local hum = char:FindFirstChildOfClass("Humanoid")
-    if hum then
-        local r = findRemoteIn(hum)
-        if r then
-            if tryFire(r, abilityKey) then
-                if holdSeconds and holdSeconds > 0 then
-                    task.wait(holdSeconds)
-                    pcall(function() r:FireServer(abilityKey, false) end)
-                end
-                return true
-            end
-        end
-    end
-
+    -- Humanoid "" channel is primary for Blox Fruits abilities.
+    if fireOnHumanoid(abilityKey, holdSeconds) then return true end
+    -- Tool remote as fallback.
+    if fireOnTool(abilityKey, holdSeconds) then return true end
     return false
 end
 
--- Diagnostics — prints all remotes on current tool + humanoid
+-- Manual single-fire test (exposed as _G.ProdigyMacroTestFire(key))
+local function testFire(abilityKey)
+    print("[ProdigyMacro] test fire ->", abilityKey)
+    local ok = fireAbilityRemote(abilityKey, 0)
+    print("[ProdigyMacro] result:", ok)
+    return ok
+end
+
+-- Diagnostics
 local function probeCurrentTool()
     local char = player.Character
-    if not char then
-        print("[Probe] No character")
-        return
-    end
+    if not char then print("[Probe] no character"); return end
     local tool = char:FindFirstChildOfClass("Tool")
     local hum  = char:FindFirstChildOfClass("Humanoid")
-    print("===== TOOL PROBE =====")
+    print("===== PROBE =====")
     print("Equipped:", tool and tool.Name or "(none)")
     if tool then
         for _, c in ipairs(tool:GetChildren()) do
-            print("  tool ->", c.ClassName, c.Name)
+            print("  tool ->", c.ClassName, "[" .. c.Name .. "]")
         end
     end
-    print("Humanoid:")
     if hum then
         for _, c in ipairs(hum:GetChildren()) do
-            print("  hum ->", c.ClassName, c.Name)
+            print("  hum  ->", c.ClassName, "[" .. c.Name .. "]")
         end
     end
-    print("======================")
+    print("==================")
 end
 
 -- ============================================================
@@ -348,7 +385,6 @@ local function runMacroLoop()
                         local holdSec = (b.mode == "Hold") and b.holdTime or 0
                         local fired = fireAbilityRemote(b.ability, holdSec)
                         if not fired and CompatibilityMode then
-                            -- explicit opt-in fallback; will shift UI
                             sendKeyRaw(kc, true)
                             task.wait(b.mode == "Hold" and b.holdTime or 0.03)
                             sendKeyRaw(kc, false)
@@ -423,9 +459,7 @@ local function stroke(obj, col, trans)
     return s
 end
 
--- ============================================================
--- FLOATING BUTTON
--- ============================================================
+-- FLOATING
 local Floating = Instance.new("TextButton")
 Floating.Name = "Floating"
 Floating.AnchorPoint = Vector2.new(1, 0)
@@ -479,14 +513,12 @@ updateFloatingVisual = function()
     end
 end
 
--- ============================================================
 -- PANEL
--- ============================================================
 local Panel = Instance.new("Frame")
 Panel.Name = "Panel"
 Panel.AnchorPoint = Vector2.new(0.5, 0.5)
 Panel.Position = UDim2.new(0.5, 0, 0.5, 0)
-Panel.Size = UDim2.new(0, 460, 0, 640)
+Panel.Size = UDim2.new(0, 460, 0, 660)
 Panel.BackgroundColor3 = C_BG
 Panel.BorderSizePixel = 0
 Panel.Visible = false
@@ -499,7 +531,7 @@ scale.Parent = Panel
 local function resizeUI()
     local cam = workspace.CurrentCamera
     if not cam then return end
-    scale.Scale = math.clamp(math.min((cam.ViewportSize.X - 20) / 460, (cam.ViewportSize.Y - 30) / 640), 0.6, 1)
+    scale.Scale = math.clamp(math.min((cam.ViewportSize.X - 20) / 460, (cam.ViewportSize.Y - 30) / 660), 0.6, 1)
 end
 resizeUI()
 if workspace.CurrentCamera then
@@ -524,7 +556,7 @@ HTitle.Parent = Header
 
 local HSub = Instance.new("TextLabel")
 HSub.BackgroundTransparency = 1
-HSub.Text = "REMOTE-FIRE MODE"
+HSub.Text = "REMOTE-FIRE v6"
 HSub.TextColor3 = C_MUTED
 HSub.Font = Enum.Font.GothamBold
 HSub.TextSize = 8
@@ -630,11 +662,45 @@ CompatToggle.MouseButton1Click:Connect(function()
     saveConfig()
 end)
 
+-- Test Fire button
+local TestRow = Instance.new("Frame")
+TestRow.BackgroundColor3 = C_PANEL
+TestRow.BorderSizePixel = 0
+TestRow.Position = UDim2.new(0, 14, 0, 166)
+TestRow.Size = UDim2.new(1, -28, 0, 40)
+TestRow.Parent = Panel
+corner(TestRow, 10)
+stroke(TestRow, C_ACCENT, 0.55)
+
+local TestBtn = Instance.new("TextButton")
+TestBtn.AutoButtonColor = false
+TestBtn.Text = "TEST FIRE (current block abilities)"
+TestBtn.TextColor3 = C_TEXT
+TestBtn.Font = Enum.Font.GothamBold
+TestBtn.TextSize = 10
+TestBtn.BackgroundTransparency = 1
+TestBtn.Size = UDim2.new(1, 0, 1, 0)
+TestBtn.Parent = TestRow
+TestBtn.MouseButton1Click:Connect(function()
+    local fired = 0
+    for i = 1, 8 do
+        local b = Blocks[i]
+        if b.enabled then
+            task.spawn(function()
+                equipWeapon(b.weapon)
+                testFire(b.ability)
+            end)
+            fired = fired + 1
+        end
+    end
+    print("[ProdigyMacro] test fired on", fired, "blocks")
+end)
+
 local BlockScroll = Instance.new("ScrollingFrame")
 BlockScroll.BackgroundTransparency = 1
 BlockScroll.BorderSizePixel = 0
-BlockScroll.Position = UDim2.new(0, 14, 0, 170)
-BlockScroll.Size = UDim2.new(1, -28, 1, -184)
+BlockScroll.Position = UDim2.new(0, 14, 0, 216)
+BlockScroll.Size = UDim2.new(1, -28, 1, -230)
 BlockScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
 BlockScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
 BlockScroll.ScrollBarThickness = 4
@@ -942,9 +1008,10 @@ do
     end)
 end
 
--- Expose probe for manual testing
 _G.ProdigyMacroProbe = probeCurrentTool
+_G.ProdigyMacroTestFire = testFire
 
 updateFloatingVisual()
-print("[ProdigyMacro] v5 loaded — remote-fire only, no UI shift")
-print("[ProdigyMacro] run _G.ProdigyMacroProbe() to dump remotes on equipped tool")
+print("[ProdigyMacro] v6 loaded — Cobalt-shape remote fire")
+print("[ProdigyMacro] _G.ProdigyMacroProbe() to dump remotes")
+print("[ProdigyMacro] _G.ProdigyMacroTestFire('Z') to test single ability")
