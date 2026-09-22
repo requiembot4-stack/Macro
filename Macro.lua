@@ -1,6 +1,7 @@
 -- ============================================================
--- PRODIGY MACRO — Standalone Test Build
--- 8-block sequential macro. Floating Start/Stop. Auto-saves.
+-- PRODIGY MACRO — Standalone Build v2
+-- 8-block sequential macro. Auto-equip per block category.
+-- Floating Start/Stop. Auto-saves.
 -- ============================================================
 
 local Players = game:GetService("Players")
@@ -113,6 +114,120 @@ local function releaseAllKeys()
     end
 end
 
+-- ============================================================
+-- TOOL CATEGORY DETECTION + AUTO EQUIP
+-- ============================================================
+local FRUIT_KEYWORDS = {
+    "blade-blade","bladeblade","portal","dough","dragon","leopard","kitsune",
+    "buddha","t-rex","trex","mammoth","sound","blizzard","spirit","venom",
+    "shadow","control","gravity","rumble","paw","spider","love","quake",
+    "magma","light","ice","flame","dark","sand","falcon","diamond","rubber",
+    "barrier","ghost","spin","chop","spring","bomb","smoke","rocket","creation",
+    "eagle","gas","lightning","tiger"
+}
+local SWORD_KEYWORDS = {
+    "blade","sword","katana","yoru","cursed","scythe","saber","pole","bisento",
+    "trident","dagger","cutlass","rapier","koko","shark","kabucha","iron",
+    "wando","twin","hook","longsword","broom","buddy"
+}
+local GUN_KEYWORDS = {
+    "gun","rifle","flintlock","slingshot","bazooka","cannon","guitar","bow",
+    "revolver","pistol"
+}
+local MELEE_KEYWORDS = {
+    "combat","black leg","electro","fishman karate","dragon talon","superhuman",
+    "death step","sharkman karate","electric claw","godhuman","sanguine art"
+}
+
+local function matchesAny(name, list)
+    for _, kw in ipairs(list) do
+        if name:find(kw, 1, true) then return true end
+    end
+    return false
+end
+
+local function detectToolCategory(tool)
+    if not tool or not tool:IsA("Tool") then return nil end
+
+    local name = string.lower(tool.Name)
+    local tip = ""
+    pcall(function() tip = string.lower(tool.ToolTip or "") end)
+
+    local hasFruitChild = tool:FindFirstChild("Fruit") ~= nil
+    local hasSwordChild = tool:FindFirstChild("Sword") ~= nil
+    local hasGunChild   = tool:FindFirstChild("Gun")   ~= nil
+
+    if hasFruitChild or tip:find("blox fruit") or tip:find("fruit") then
+        return "Fruit"
+    end
+    if name:find("-") then
+        local a, b = name:match("^([%w%s]+)%-(%w+)$")
+        if a and b and (a:find(b) or b:find(a)) then
+            return "Fruit"
+        end
+    end
+    for _, kw in ipairs(FRUIT_KEYWORDS) do
+        if name:find(kw, 1, true) then
+            if not matchesAny(name, SWORD_KEYWORDS) and not matchesAny(name, GUN_KEYWORDS) then
+                return "Fruit"
+            end
+            break
+        end
+    end
+
+    if hasSwordChild or tip:find("sword") or matchesAny(name, SWORD_KEYWORDS) then
+        return "Sword"
+    end
+    if hasGunChild or tip:find("gun") or matchesAny(name, GUN_KEYWORDS) then
+        return "Gun"
+    end
+    if matchesAny(name, MELEE_KEYWORDS) then
+        return "Melee"
+    end
+    if not hasFruitChild and not hasSwordChild and not hasGunChild then
+        return "Melee"
+    end
+    return nil
+end
+
+local function findToolForWeapon(weapon)
+    local char = player.Character
+    if not char then return nil end
+    local backpack = player:FindFirstChild("Backpack")
+    for _, cont in ipairs({char, backpack}) do
+        if cont then
+            for _, tool in ipairs(cont:GetChildren()) do
+                if tool:IsA("Tool") and detectToolCategory(tool) == weapon then
+                    return tool
+                end
+            end
+        end
+    end
+    return nil
+end
+
+local function equipWeapon(weapon)
+    local char = player.Character
+    if not char then return false end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not hum then return false end
+
+    local current = char:FindFirstChildOfClass("Tool")
+    if current and detectToolCategory(current) == weapon then
+        return true
+    end
+
+    local tool = findToolForWeapon(weapon)
+    if not tool then return false end
+
+    pcall(function() hum:EquipTool(tool) end)
+    task.wait(0.10)
+    return true
+end
+
+-- ============================================================
+-- MACRO LOOP
+-- ============================================================
 local function runMacroLoop()
     while MacroRunning do
         for i = 1, 8 do
@@ -121,10 +236,13 @@ local function runMacroLoop()
             if b.enabled then
                 local kc = KEY_MAP[b.ability]
                 if kc then
-                    if b.mode == "Hold" then
-                        holdKey(kc, b.holdTime)
-                    else
-                        tapKey(kc)
+                    local ok = equipWeapon(b.weapon)
+                    if ok then
+                        if b.mode == "Hold" then
+                            holdKey(kc, b.holdTime)
+                        else
+                            tapKey(kc)
+                        end
                     end
                 end
                 task.wait(INTER_BLOCK_DELAY)
@@ -510,7 +628,7 @@ local function buildBlockCard(parent, index)
     local wLeft = makeArrow(weaponBox, "left")
     local wRight = makeArrow(weaponBox, "right")
 
-    -- Ability (declared here so weapon handlers can reset it)
+    -- Ability
     local abilityBox = makeRow(108, "Ability")
     local abilityLabel = makeValueLabel(abilityBox)
     local abilityIndex = 1
@@ -672,4 +790,4 @@ do
 end
 
 updateFloatingVisual()
-print("[ProdigyMacro] Loaded — floating button top-right, gear opens panel")
+print("[ProdigyMacro] v2 loaded — auto-equip per block active")
