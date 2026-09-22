@@ -1,12 +1,11 @@
 -- ============================================================
--- PRODIGY MACRO — Standalone Build v3
+-- PRODIGY MACRO — Standalone Build v2
 -- 8-block sequential macro. Auto-equip per block category.
--- Mobile UI protection while running. Floating Start/Stop.
+-- Floating Start/Stop. Auto-saves.
 -- ============================================================
 
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
-local RunService = game:GetService("RunService")
 local TweenService = game:GetService("TweenService")
 local HttpService = game:GetService("HttpService")
 local CoreGui = game:GetService("CoreGui")
@@ -114,57 +113,6 @@ local function releaseAllKeys()
         sendKey(kc, false)
     end
 end
-
--- ============================================================
--- MOBILE UI PROTECTION
--- VirtualInputManager sets LastInputType to Keyboard, which makes
--- the game swap to PC layout. Force mobile containers back visible.
--- ============================================================
-local cachedMobileContainers = nil
-local lastContainerScan = 0
-
-local function scanMobileContainers()
-    local list = {}
-    local pg = player:FindFirstChild("PlayerGui")
-    if not pg then return list end
-    local keywords = {"mobile", "touch", "joystick", "dpad", "joypad", "thumbstick", "virtual"}
-    for _, obj in ipairs(pg:GetDescendants()) do
-        if obj:IsA("GuiObject") or obj:IsA("ScreenGui") then
-            local n = string.lower(obj.Name)
-            for _, kw in ipairs(keywords) do
-                if n:find(kw, 1, true) then
-                    table.insert(list, obj)
-                    break
-                end
-            end
-        end
-    end
-    return list
-end
-
-local function nudgeMobileUI()
-    if not UserInputService.TouchEnabled then return end
-    local now = os.clock()
-    if not cachedMobileContainers or (now - lastContainerScan) > 3 then
-        cachedMobileContainers = scanMobileContainers()
-        lastContainerScan = now
-    end
-    for _, c in ipairs(cachedMobileContainers) do
-        pcall(function()
-            if c:IsA("ScreenGui") then
-                c.Enabled = true
-            elseif c:IsA("GuiObject") then
-                c.Visible = true
-            end
-        end)
-    end
-end
-
-RunService.RenderStepped:Connect(function()
-    if MacroRunning then
-        pcall(nudgeMobileUI)
-    end
-end)
 
 -- ============================================================
 -- TOOL CATEGORY DETECTION + AUTO EQUIP
@@ -842,4 +790,4 @@ do
 end
 
 updateFloatingVisual()
-print("[ProdigyMacro] v3 loaded — mobile UI protection active")
+print("[ProdigyMacro] v2 loaded — auto-equip per block active")
