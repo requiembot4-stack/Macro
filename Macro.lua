@@ -1,6 +1,8 @@
 -- ============================================================
--- PRODIGY MACRO — Standalone Build v9
--- v3 flow + UIS metatable hook. No mouse bounce.
+-- PRODIGY MACRO — Standalone Build v11
+-- One-pass sequence. Blocks fire in strict order.
+-- Waits for game's own cooldown frame per block. Auto-stops
+-- on unavailable / on-cooldown / stuck. No loop-back.
 -- ============================================================
 
 local Players = game:GetService("Players")
@@ -15,9 +17,12 @@ pcall(function() VirtualInputManager = game:GetService("VirtualInputManager") en
 local player = Players.LocalPlayer
 local CONFIG_FILE = "ProdigyMacro_Config.json"
 local INTER_BLOCK_DELAY = 0.05
+local CAST_WAIT_MAX     = 0.40
+local COOLDOWN_WAIT_MAX = 8.0
+local POST_BLOCK_FLOOR  = 0.20
 
 -- ============================================================
--- UI-SHIFT SUPPRESSION (metatable hook only)
+-- UI-SHIFT SUPPRESSION
 -- ============================================================
 local UIS_HOOK_OK = false
 
@@ -72,10 +77,10 @@ do
     end
 end
 
-print("[v9] UIS metatable hook:", UIS_HOOK_OK and "OK" or "FAILED")
+print("[v11] UIS metatable hook:", UIS_HOOK_OK and "OK" or "FAILED")
 
 -- ============================================================
--- Hide any desktop panel that still slips through
+-- Hide desktop panels if any leak through
 -- ============================================================
 local function looksLikeKeyHint(text)
     if not text or text == "" then return false end
@@ -137,6 +142,7 @@ local KEY_MAP = {
 local MacroEnabled = false
 local MacroRunning = false
 local MacroThread = nil
+local refreshFloating
 
 local Blocks = {}
 for i = 1, 8 do
@@ -189,7 +195,7 @@ end
 loadConfig()
 
 -- ============================================================
--- EXECUTION — virtual keys, no mouse bounce
+-- KEY SEND
 -- ============================================================
 local function sendKey(keyCode, down)
     if not VirtualInputManager then return end
@@ -217,7 +223,7 @@ local function releaseAllKeys()
 end
 
 -- ============================================================
--- TOOL CATEGORY DETECTION + AUTO EQUIP
+-- TOOL CATEGORY
 -- ============================================================
 local FRUIT_KEYWORDS = {
     "blade-blade","bladeblade","portal","dough","dragon","leopard","kitsune",
@@ -293,56 +299,168 @@ local function findToolForWeapon(weapon)
     return nil
 end
 
-local function equipWeapon(weapon)
-    local char = player.Character
-    if not char then return false end
-    local hum = char:FindFirstChildOfClass("Humanoid")
-    if not hum then return false end
-    local current = char:FindFirstChildOfClass("Tool")
-    if current and detectToolCategory(current) == weapon then return true end
-    local tool = findToolForWeapon(weapon)
-    if not tool then return false end
-    pcall(function() hum:EquipTool(tool) end)
-    task.wait(0.10)
-    return true
-end
+-- ============================================================
+-- COOLDOWN FRAME — search whole Skills tree (path fixed)
+-- ============================================================
+local function getCooldownFrame(abilityKey)
+    local pg = player:FindFirstChild("PlayerGui")
+    if not pg then return nil end
+    local main = pg:FindFirstChild("Main")
+    if not main then return nil end
+    local skills = main:FindFirstChild("Skills")
+    if not skills then return nil end
 
--- ============================================================
--- MACRO LOOP
--- ============================================================
-local function runMacroLoop()
-    while MacroRunning do
-        for i = 1, 8 do
-            if not MacroRunning then break end
-            local b = Blocks[i]
-            if b.enabled then
-                local kc = KEY_MAP[b.ability]
-                if kc then
-                    local ok = equipWeapon(b.weapon)
-                    if ok then
-                        if b.mode == "Hold" then
-                            holdKey(kc, b.holdTime)
-                        else
-                            tapKey(kc)
-                        end
-                    end
-                end
-                task.wait(INTER_BLOCK_DELAY)
+    -- walk every descendant looking for a Cooldown whose parent is the key
+    for _, desc in ipairs(skills:GetDescendants()) do
+        if desc:IsA("GuiObject") and desc.Name == "Cooldown" then
+            local p = desc.Parent
+            if p and p.Name == abilityKey then
+                return desc
             end
         end
-        task.wait(INTER_BLOCK_DELAY)
     end
-    MacroThread = nil
+    return nil
 end
 
-local function startMacro()
+local function isCooldownActive(cdFrame)
+    if not cdFrame or not cdFrame.Parent then return false end
+    if not cdFrame.Visible then return false end
+    local yS = cdFrame.Size.Y.Scale
+    local yO = cdFrame.Size.Y.Offset
+    return (yS > 0.02) or (yO > 2)
+end
+
+-- ============================================================
+-- BLOCK EXECUTION
+-- ============================================================
+local function blockPrecheck(b)
+    local allowed = ABILITY_MAP[b.weapon]
+    if not allowed then return "bad_weapon" end
+    local validAbility = false
+    for _, a in ipairs(allowed) do
+        if a == b.ability then validAbility = true; break end
+    end
+    if not validAbility then return "bad_ability" end
+
+    local char = player.Character
+    if not char then return "no_character" end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not hum or hum.Health <= 0 then return "no_character" end
+
+    local current = char:FindFirstChildOfClass("Tool")
+    local cat = current and detectToolCategory(current)
+
+    if cat ~= b.weapon then
+        local tool = findToolForWeapon(b.weapon)
+        if not tool then return "weapon_unavailable" end
+        pcall(function() hum:EquipTool(tool) end)
+        task.wait(0.20)
+        current = char:FindFirstChildOfClass("Tool")
+        cat = current and detectToolCategory(current)
+        if cat ~= b.weapon then return "equip_failed" end
+    end
+
+    return "ok"
+end
+
+local function fireBlock(b)
+    local pre = blockPrecheck(b)
+    if pre ~= "ok" then return pre end
+
+    local cd = getCooldownFrame(b.ability)
+    if cd and isCooldownActive(cd) then return "on_cooldown" end
+
+    local kc = KEY_MAP[b.ability]
+    if not kc then return "bad_key" end
+
+    if b.mode == "Hold" then
+        holdKey(kc, b.holdTime)
+    else
+        tapKey(kc)
+    end
+
+    if not cd then
+        -- no cooldown frame found — use fixed floor
+        task.wait(POST_BLOCK_FLOOR)
+        return "ok"
+    end
+
+    -- wait for cooldown to begin (confirms the cast landed)
+    local t0 = os.clock()
+    local started = false
+    while (os.clock() - t0) < CAST_WAIT_MAX do
+        if isCooldownActive(cd) then started = true; break end
+        task.wait(0.02)
+    end
+
+    if not started then
+        -- ability had no cooldown (basic melee, etc) — short floor
+        task.wait(POST_BLOCK_FLOOR)
+        return "ok"
+    end
+
+    -- wait for cooldown to fully clear
+    local t1 = os.clock()
+    while (os.clock() - t1) < COOLDOWN_WAIT_MAX do
+        if not isCooldownActive(cd) then
+            task.wait(POST_BLOCK_FLOOR)
+            return "ok"
+        end
+        task.wait(0.05)
+    end
+
+    return "cooldown_stuck"
+end
+
+-- ============================================================
+-- MACRO — ONE PASS, NO LOOP
+-- ============================================================
+local function anyBlockEnabled()
+    for i = 1, 8 do
+        if Blocks[i].enabled then return true end
+    end
+    return false
+end
+
+local function runMacroLoop()
+    if not anyBlockEnabled() then
+        print("[ProdigyMacro] no enabled blocks")
+        stopMacro()
+        if refreshFloating then refreshFloating() end
+        return
+    end
+
+    for i = 1, 8 do
+        if not MacroRunning then break end
+        local b = Blocks[i]
+        if b.enabled then
+            local result = fireBlock(b)
+            if result ~= "ok" then
+                print(string.format(
+                    "[ProdigyMacro] block %d (%s %s) stopped: %s",
+                    i, b.weapon, b.ability, result))
+                stopMacro()
+                if refreshFloating then refreshFloating() end
+                return
+            end
+            task.wait(INTER_BLOCK_DELAY)
+        end
+    end
+
+    -- pass finished — stop, do not wrap to block 1
+    print("[ProdigyMacro] sequence complete — stopping")
+    stopMacro()
+    if refreshFloating then refreshFloating() end
+end
+
+function startMacro()
     if MacroRunning then return end
     if not MacroEnabled then return end
     MacroRunning = true
     MacroThread = task.spawn(runMacroLoop)
 end
 
-local function stopMacro()
+function stopMacro()
     MacroRunning = false
     MacroThread = nil
     releaseAllKeys()
@@ -430,8 +548,7 @@ GearBtn.Parent = Floating
 corner(GearBtn, 999)
 stroke(GearBtn, C_ACCENT, 0.35)
 
-local updateFloatingVisual
-updateFloatingVisual = function()
+refreshFloating = function()
     if MacroRunning then
         FloatingIcon.Text = "■"
         FloatingIcon.TextColor3 = C_RED
@@ -489,7 +606,7 @@ HTitle.Parent = Header
 
 local HSub = Instance.new("TextLabel")
 HSub.BackgroundTransparency = 1
-HSub.Text = UIS_HOOK_OK and "INPUT HOOK ACTIVE" or "INPUT HOOK FAILED — CHECK EXECUTOR"
+HSub.Text = UIS_HOOK_OK and "STRICT ORDER • ONE PASS" or "HOOK FAILED"
 HSub.TextColor3 = UIS_HOOK_OK and C_GREEN or C_RED
 HSub.Font = Enum.Font.GothamBold
 HSub.TextSize = 8
@@ -549,7 +666,7 @@ EnableToggle.MouseButton1Click:Connect(function()
     EnableToggle.TextColor3 = MacroEnabled and C_GREEN or C_MUTED
     EnableToggle.BackgroundColor3 = MacroEnabled and Color3.fromRGB(4, 30, 20) or Color3.fromRGB(20, 20, 30)
     if not MacroEnabled then stopMacro() end
-    updateFloatingVisual()
+    refreshFloating()
     saveConfig()
 end)
 
@@ -790,7 +907,7 @@ Floating.MouseButton1Click:Connect(function()
     else
         startMacro()
     end
-    updateFloatingVisual()
+    refreshFloating()
 end)
 
 GearBtn.MouseButton1Click:Connect(function()
@@ -855,5 +972,5 @@ do
     end)
 end
 
-updateFloatingVisual()
-print("[ProdigyMacro] v9 loaded — UIS hook only, no mouse bounce")
+refreshFloating()
+print("[ProdigyMacro] v11 loaded — one-pass sequence, cooldown-gated")
