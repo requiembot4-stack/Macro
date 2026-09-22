@@ -1,6 +1,6 @@
 -- ============================================================
--- PRODIGY MACRO — Standalone Build v7
--- v3 flow (virtual keys) + UI-shift suppression.
+-- PRODIGY MACRO — Standalone Build v8
+-- Aggressive input-type spoof: property reads + event signal.
 -- ============================================================
 
 local Players = game:GetService("Players")
@@ -19,47 +19,81 @@ local INTER_BLOCK_DELAY = 0.05
 -- ============================================================
 -- UI-SHIFT SUPPRESSION
 -- ============================================================
--- Layer 1: lie to the game about LastInputType.
---   Blox Fruits reads UIS:GetLastInputType() to decide layout.
---   We return Touch always so it never swaps to desktop HUD.
+local UIS_HOOK_OK = false
+
 do
     local ok, mt = pcall(getrawmetatable, UserInputService)
     if ok and mt then
         pcall(function()
             if setreadonly then setreadonly(mt, false) end
             local oldIndex = mt.__index
+            local oldNewIndex = mt.__newindex
+
+            -- fake signal that swallows every Connect
+            local FakeEvent = Instance.new("BindableEvent")
+            local FakeSignal = {
+                Connect = function(_, fn)
+                    -- return a dead connection object
+                    return { Disconnect = function() end }
+                end,
+                Wait = function() task.wait(9e9) end,
+            }
+            setmetatable(FakeSignal, { __index = function() return function() end end })
+
             mt.__index = function(self, key)
                 if key == "GetLastInputType" then
-                    return function()
-                        return Enum.UserInputType.Touch
-                    end
+                    return function() return Enum.UserInputType.Touch end
                 end
-                if oldIndex then
-                    return oldIndex(self, key)
+                if key == "GetLastInputTypeForDevice" then
+                    return function() return Enum.UserInputType.Touch end
                 end
+                if key == "GetConnectedGamepads" then
+                    return function() return {} end
+                end
+                if key == "KeyboardEnabled" then return false end
+                if key == "MouseEnabled" then return false end
+                if key == "GamepadEnabled" then return false end
+                if key == "TouchEnabled" then return true end
+                if key == "LastInputTypeChanged" then return FakeSignal end
+                if key == "LastInputType" then return Enum.UserInputType.Touch end
+                if oldIndex then return oldIndex(self, key) end
                 return nil
             end
+
+            if oldNewIndex then
+                mt.__newindex = function(self, key, value)
+                    -- block anything trying to write enabled-state
+                    if key == "KeyboardEnabled" or key == "MouseEnabled" then
+                        return
+                    end
+                    oldNewIndex(self, key, value)
+                end
+            end
+
             if setreadonly then setreadonly(mt, true) end
+            UIS_HOOK_OK = true
         end)
     end
 end
 
--- Layer 2: after each virtual key, flip engine flag back to a
--- non-keyboard state so no listener catches "Keyboard".
+print("[v8] UIS metatable hook:", UIS_HOOK_OK and "OK" or "FAILED")
+
+-- ============================================================
+-- Post-key nudge: bounce engine back to non-keyboard immediately
+-- ============================================================
 local function flipBackToNonKeyboard()
     if not VirtualInputManager then return end
-    -- harmless click at (0,0) — no game GUI sits there
     pcall(function()
         VirtualInputManager:SendMouseButtonEvent(0, 0, 0, true, game, 1)
     end)
-    task.wait(0.005)
     pcall(function()
         VirtualInputManager:SendMouseButtonEvent(0, 0, 0, false, game, 1)
     end)
 end
 
--- Layer 3: hide the desktop panel that appears on rapid swaps.
---   Exact path from diagnostic: PlayerGui.Main.Skills.Combat
+-- ============================================================
+-- Hide any desktop panel that still slips through
+-- ============================================================
 local function looksLikeKeyHint(text)
     if not text or text == "" then return false end
     if text:find("%[[ZzXxCcVvFfM1m1]%]") then return true end
@@ -72,7 +106,6 @@ local function hideDesktopPanels()
     local pg = player:FindFirstChild("PlayerGui")
     if not pg then return end
 
-    -- Explicit path from the diagnostic
     local main = pg:FindFirstChild("Main")
     if main then
         local skills = main:FindFirstChild("Skills")
@@ -84,7 +117,6 @@ local function hideDesktopPanels()
         end
     end
 
-    -- Heuristic for anything else with key-hint text
     for _, obj in ipairs(pg:GetDescendants()) do
         if obj:IsA("TextLabel") and obj.Visible and looksLikeKeyHint(obj.Text) then
             local frame = obj
@@ -174,7 +206,7 @@ end
 loadConfig()
 
 -- ============================================================
--- EXECUTION (virtual keys — the flow that works)
+-- EXECUTION
 -- ============================================================
 local function sendKey(keyCode, down)
     if not VirtualInputManager then return end
@@ -381,7 +413,6 @@ local function stroke(obj, col, trans)
     return s
 end
 
--- FLOATING
 local Floating = Instance.new("TextButton")
 Floating.Name = "Floating"
 Floating.AnchorPoint = Vector2.new(1, 0)
@@ -435,7 +466,6 @@ updateFloatingVisual = function()
     end
 end
 
--- PANEL
 local Panel = Instance.new("Frame")
 Panel.Name = "Panel"
 Panel.AnchorPoint = Vector2.new(0.5, 0.5)
@@ -478,13 +508,13 @@ HTitle.Parent = Header
 
 local HSub = Instance.new("TextLabel")
 HSub.BackgroundTransparency = 1
-HSub.Text = "8-BLOCK SEQUENCER"
-HSub.TextColor3 = C_MUTED
+HSub.Text = UIS_HOOK_OK and "INPUT HOOK ACTIVE" or "INPUT HOOK FAILED — CHECK EXECUTOR"
+HSub.TextColor3 = UIS_HOOK_OK and C_GREEN or C_RED
 HSub.Font = Enum.Font.GothamBold
 HSub.TextSize = 8
 HSub.TextXAlignment = Enum.TextXAlignment.Left
 HSub.Position = UDim2.new(0, 18, 0, 30)
-HSub.Size = UDim2.new(0, 220, 0, 12)
+HSub.Size = UDim2.new(0, 260, 0, 12)
 HSub.Parent = Header
 
 local CloseBtn = Instance.new("TextButton")
@@ -558,9 +588,6 @@ BlockLayout.Padding = UDim.new(0, 10)
 BlockLayout.SortOrder = Enum.SortOrder.LayoutOrder
 BlockLayout.Parent = BlockScroll
 
--- ============================================================
--- BLOCK CARD BUILDER
--- ============================================================
 local function buildBlockCard(parent, index)
     local block = Blocks[index]
 
@@ -662,7 +689,6 @@ local function buildBlockCard(parent, index)
         return lbl
     end
 
-    -- Mode
     local modeBox = makeRow(44, "Mode")
     local modeLabel = makeValueLabel(modeBox)
     local modeIndex = (block.mode == "Hold") and 2 or 1
@@ -685,7 +711,6 @@ local function buildBlockCard(parent, index)
         applyMode()
     end)
 
-    -- Weapon
     local weaponBox = makeRow(76, "Weapon")
     local weaponLabel = makeValueLabel(weaponBox)
     local weaponIndex = table.find(WEAPONS, block.weapon) or 1
@@ -693,7 +718,6 @@ local function buildBlockCard(parent, index)
     local wLeft = makeArrow(weaponBox, "left")
     local wRight = makeArrow(weaponBox, "right")
 
-    -- Ability
     local abilityBox = makeRow(108, "Ability")
     local abilityLabel = makeValueLabel(abilityBox)
     local abilityIndex = 1
@@ -748,7 +772,6 @@ local function buildBlockCard(parent, index)
         saveConfig()
     end)
 
-    -- Hold Time
     local holdBox = makeRow(140, "Hold Time")
     local holdInput = Instance.new("TextBox")
     holdInput.ClearTextOnFocus = false
@@ -776,9 +799,6 @@ for i = 1, 8 do
     buildBlockCard(BlockScroll, i)
 end
 
--- ============================================================
--- FLOATING BUTTON INTERACTION
--- ============================================================
 Floating.MouseButton1Click:Connect(function()
     if not MacroEnabled then
         Panel.Visible = true
@@ -855,4 +875,4 @@ do
 end
 
 updateFloatingVisual()
-print("[ProdigyMacro] v7 loaded — v3 keys + UI-shift suppression (3 layers)")
+print("[ProdigyMacro] v8 loaded — aggressive UIS hook")
