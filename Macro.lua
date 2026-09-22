@@ -1,7 +1,7 @@
 -- ============================================================
--- PRODIGY MACRO — Standalone Build v2
+-- PRODIGY MACRO — Standalone Build v3
 -- 8-block sequential macro. Auto-equip per block category.
--- Floating Start/Stop. Auto-saves.
+-- PC-keyboard UI suppressor while running.
 -- ============================================================
 
 local Players = game:GetService("Players")
@@ -9,6 +9,7 @@ local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
 local HttpService = game:GetService("HttpService")
 local CoreGui = game:GetService("CoreGui")
+local RunService = game:GetService("RunService")
 local VirtualInputManager = nil
 pcall(function() VirtualInputManager = game:GetService("VirtualInputManager") end)
 
@@ -224,6 +225,40 @@ local function equipWeapon(weapon)
     task.wait(0.10)
     return true
 end
+
+-- ============================================================
+-- PC-UI SUPPRESSOR
+-- Blox Fruits swaps to a keyboard-hint overlay when it detects
+-- virtual keyboard events. Hide that panel while macro runs.
+-- ============================================================
+local function looksLikeKeyHint(text)
+    if not text or text == "" then return false end
+    if text:find("%[[ZzXxCcVvFfM1m1]%]") then return true end
+    if text:find("^Use ") then return true end
+    return false
+end
+
+local function hideKeyHintUI()
+    if not MacroRunning then return end
+    local pg = player:FindFirstChild("PlayerGui")
+    if not pg then return end
+    for _, obj in ipairs(pg:GetDescendants()) do
+        if obj:IsA("TextLabel") and obj.Visible and looksLikeKeyHint(obj.Text) then
+            local frame = obj
+            while frame.Parent and frame.Parent ~= pg do
+                if frame:IsA("Frame") then
+                    frame.Visible = false
+                    break
+                end
+                frame = frame.Parent
+            end
+        end
+    end
+end
+
+RunService.RenderStepped:Connect(function()
+    pcall(hideKeyHintUI)
+end)
 
 -- ============================================================
 -- MACRO LOOP
@@ -790,4 +825,4 @@ do
 end
 
 updateFloatingVisual()
-print("[ProdigyMacro] v2 loaded — auto-equip per block active")
+print("[ProdigyMacro] v3 loaded — auto-equip + PC-UI suppressor active")
