@@ -1,8 +1,6 @@
 -- ============================================================
--- PRODIGY MACRO — Standalone Build v6
--- Remote-fire ONLY. Cobalt-dump shape from real Blox Fruits.
--- Channel priority: Humanoid[""] (ability) > tool remote.
--- Payload priority: (key, true) first.
+-- PRODIGY MACRO — Standalone Build v7
+-- v3 flow (virtual keys) + UI-shift suppression.
 -- ============================================================
 
 local Players = game:GetService("Players")
@@ -17,6 +15,93 @@ pcall(function() VirtualInputManager = game:GetService("VirtualInputManager") en
 local player = Players.LocalPlayer
 local CONFIG_FILE = "ProdigyMacro_Config.json"
 local INTER_BLOCK_DELAY = 0.05
+
+-- ============================================================
+-- UI-SHIFT SUPPRESSION
+-- ============================================================
+-- Layer 1: lie to the game about LastInputType.
+--   Blox Fruits reads UIS:GetLastInputType() to decide layout.
+--   We return Touch always so it never swaps to desktop HUD.
+do
+    local ok, mt = pcall(getrawmetatable, UserInputService)
+    if ok and mt then
+        pcall(function()
+            if setreadonly then setreadonly(mt, false) end
+            local oldIndex = mt.__index
+            mt.__index = function(self, key)
+                if key == "GetLastInputType" then
+                    return function()
+                        return Enum.UserInputType.Touch
+                    end
+                end
+                if oldIndex then
+                    return oldIndex(self, key)
+                end
+                return nil
+            end
+            if setreadonly then setreadonly(mt, true) end
+        end)
+    end
+end
+
+-- Layer 2: after each virtual key, flip engine flag back to a
+-- non-keyboard state so no listener catches "Keyboard".
+local function flipBackToNonKeyboard()
+    if not VirtualInputManager then return end
+    -- harmless click at (0,0) — no game GUI sits there
+    pcall(function()
+        VirtualInputManager:SendMouseButtonEvent(0, 0, 0, true, game, 1)
+    end)
+    task.wait(0.005)
+    pcall(function()
+        VirtualInputManager:SendMouseButtonEvent(0, 0, 0, false, game, 1)
+    end)
+end
+
+-- Layer 3: hide the desktop panel that appears on rapid swaps.
+--   Exact path from diagnostic: PlayerGui.Main.Skills.Combat
+local function looksLikeKeyHint(text)
+    if not text or text == "" then return false end
+    if text:find("%[[ZzXxCcVvFfM1m1]%]") then return true end
+    if text:find("^Use ") then return true end
+    return false
+end
+
+local function hideDesktopPanels()
+    if not MacroRunning then return end
+    local pg = player:FindFirstChild("PlayerGui")
+    if not pg then return end
+
+    -- Explicit path from the diagnostic
+    local main = pg:FindFirstChild("Main")
+    if main then
+        local skills = main:FindFirstChild("Skills")
+        if skills then
+            local combat = skills:FindFirstChild("Combat")
+            if combat and combat:IsA("GuiObject") and combat.Visible then
+                combat.Visible = false
+            end
+        end
+    end
+
+    -- Heuristic for anything else with key-hint text
+    for _, obj in ipairs(pg:GetDescendants()) do
+        if obj:IsA("TextLabel") and obj.Visible and looksLikeKeyHint(obj.Text) then
+            local frame = obj
+            while frame.Parent and frame.Parent ~= pg do
+                if frame:IsA("Frame") then
+                    frame.Visible = false
+                    break
+                end
+                frame = frame.Parent
+            end
+        end
+    end
+end
+
+RunService.RenderStepped:Connect(function()
+    pcall(hideDesktopPanels)
+end)
 
 -- ============================================================
 -- DATA
@@ -37,7 +122,6 @@ local KEY_MAP = {
 local MacroEnabled = false
 local MacroRunning = false
 local MacroThread = nil
-local CompatibilityMode = false
 
 local Blocks = {}
 for i = 1, 8 do
@@ -54,7 +138,7 @@ end
 -- PERSISTENCE
 -- ============================================================
 local function saveConfig()
-    local data = { enabled = MacroEnabled, compat = CompatibilityMode, blocks = {} }
+    local data = { enabled = MacroEnabled, blocks = {} }
     for i, b in ipairs(Blocks) do data.blocks[i] = b end
     pcall(function()
         if writefile then
@@ -69,7 +153,6 @@ local function loadConfig()
         local data = HttpService:JSONDecode(readfile(CONFIG_FILE))
         if type(data) ~= "table" then return end
         if data.enabled ~= nil then MacroEnabled = data.enabled == true end
-        if data.compat ~= nil then CompatibilityMode = data.compat == true end
         if type(data.blocks) ~= "table" then return end
         for i = 1, math.min(8, #data.blocks) do
             local b = data.blocks[i]
@@ -91,191 +174,33 @@ end
 loadConfig()
 
 -- ============================================================
--- ABILITY FIRING — REMOTE ONLY
+-- EXECUTION (virtual keys — the flow that works)
 -- ============================================================
-local function sendKeyRaw(keyCode, down)
+local function sendKey(keyCode, down)
     if not VirtualInputManager then return end
     pcall(function()
         VirtualInputManager:SendKeyEvent(down, keyCode, false, game)
     end)
 end
 
+local function tapKey(keyCode)
+    sendKey(keyCode, true)
+    task.wait(0.03)
+    sendKey(keyCode, false)
+    flipBackToNonKeyboard()
+end
+
+local function holdKey(keyCode, duration)
+    sendKey(keyCode, true)
+    task.wait(duration)
+    sendKey(keyCode, false)
+    flipBackToNonKeyboard()
+end
+
 local function releaseAllKeys()
-    if not CompatibilityMode then return end
-    for _, kc in pairs(KEY_MAP) do sendKeyRaw(kc, false) end
-end
-
--- Try a payload shape against a remote (auto-routes InvokeServer vs FireServer).
-local function attempt(remote, args)
-    if not remote then return false end
-    -- strip trailing nils
-    local clean = {}
-    for i = 1, #args do
-        if args[i] ~= nil then clean[#clean + 1] = args[i] end
+    for _, kc in pairs(KEY_MAP) do
+        sendKey(kc, false)
     end
-    local ok = pcall(function()
-        if remote:IsA("RemoteFunction") then
-            remote:InvokeServer(table.unpack(clean))
-        else
-            remote:FireServer(table.unpack(clean))
-        end
-    end)
-    return ok
-end
-
--- Blox Fruits ability channel: Humanoid[""] RemoteFunction (or RemoteEvent).
--- Signature from Cobalt dump: (abilityKey, true)
-local function fireOnHumanoid(abilityKey, holdSeconds)
-    local char = player.Character
-    if not char then return false end
-    local hum = char:FindFirstChildOfClass("Humanoid")
-    if not hum then return false end
-
-    local remote = hum:FindFirstChild("")
-    if not remote then
-        for _, c in ipairs(hum:GetChildren()) do
-            if c.Name == "" and (c:IsA("RemoteFunction") or c:IsA("RemoteEvent")) then
-                remote = c
-                break
-            end
-        end
-    end
-    if not remote then return false end
-
-    local myRoot = char:FindFirstChild("HumanoidRootPart")
-    local pos = myRoot and myRoot.Position or Vector3.zero
-    local targetPart = _G.currentSilentAimTarget
-    local targetRoot = targetPart and targetPart.Parent
-        and targetPart.Parent:FindFirstChild("HumanoidRootPart")
-
-    -- Shape priority from real dumps:
-    --  1. (key, true)                        -- fruit / combat primary
-    --  2. (key)                              -- some melee
-    --  3. (key, pos, targetRoot)             -- Buddy Sword / positional
-    --  4. (key, true, targetRoot)            -- alt variant
-    --  5. (key, pos)
-    --  6. (key, targetRoot)
-    local payloads = {
-        {abilityKey, true},
-        {abilityKey},
-        {abilityKey, pos, targetRoot},
-        {abilityKey, true, targetRoot},
-        {abilityKey, pos},
-        {abilityKey, targetRoot},
-    }
-
-    for _, args in ipairs(payloads) do
-        if attempt(remote, args) then
-            if holdSeconds and holdSeconds > 0 then
-                task.wait(holdSeconds)
-                pcall(function()
-                    if remote:IsA("RemoteFunction") then
-                        remote:InvokeServer(abilityKey, false)
-                    else
-                        remote:FireServer(abilityKey, false)
-                    end
-                end)
-            end
-            return true
-        end
-    end
-    return false
-end
-
--- Fallback: some tools carry their ability remote directly.
-local REMOTE_NAMES = {
-    "RemoteEvent", "", "Remote", "AbilityRemote", "CommE",
-    "Skill", "Attack", "Use", "Server", "Event", "Fire"
-}
-
-local function findRemoteIn(container)
-    if not container then return nil end
-    for _, name in ipairs(REMOTE_NAMES) do
-        local child = container:FindFirstChild(name)
-        if child and (child:IsA("RemoteEvent") or child:IsA("RemoteFunction")) then
-            return child
-        end
-    end
-    for _, child in ipairs(container:GetChildren()) do
-        if child:IsA("RemoteEvent") or child:IsA("RemoteFunction") then
-            return child
-        end
-    end
-    return nil
-end
-
-local function fireOnTool(abilityKey, holdSeconds)
-    local char = player.Character
-    if not char then return false end
-    local tool = char:FindFirstChildOfClass("Tool")
-    if not tool then return false end
-
-    local remote = findRemoteIn(tool)
-    if not remote then return false end
-
-    local myRoot = char:FindFirstChild("HumanoidRootPart")
-    local pos = myRoot and myRoot.Position or Vector3.zero
-    local targetPart = _G.currentSilentAimTarget
-    local targetRoot = targetPart and targetPart.Parent
-        and targetPart.Parent:FindFirstChild("HumanoidRootPart")
-
-    -- The tool's "RemoteEvent" is the equip/unequip channel for fruits.
-    -- Firing (true) equips — that path is separate.
-    -- For tool-specific abilities, try the common ability shapes.
-    local payloads = {
-        {abilityKey, true},
-        {abilityKey},
-        {abilityKey, pos, targetRoot},
-        {abilityKey, pos},
-    }
-
-    for _, args in ipairs(payloads) do
-        if attempt(remote, args) then
-            if holdSeconds and holdSeconds > 0 then
-                task.wait(holdSeconds)
-                pcall(function() remote:FireServer(abilityKey, false) end)
-            end
-            return true
-        end
-    end
-    return false
-end
-
-local function fireAbilityRemote(abilityKey, holdSeconds)
-    -- Humanoid "" channel is primary for Blox Fruits abilities.
-    if fireOnHumanoid(abilityKey, holdSeconds) then return true end
-    -- Tool remote as fallback.
-    if fireOnTool(abilityKey, holdSeconds) then return true end
-    return false
-end
-
--- Manual single-fire test (exposed as _G.ProdigyMacroTestFire(key))
-local function testFire(abilityKey)
-    print("[ProdigyMacro] test fire ->", abilityKey)
-    local ok = fireAbilityRemote(abilityKey, 0)
-    print("[ProdigyMacro] result:", ok)
-    return ok
-end
-
--- Diagnostics
-local function probeCurrentTool()
-    local char = player.Character
-    if not char then print("[Probe] no character"); return end
-    local tool = char:FindFirstChildOfClass("Tool")
-    local hum  = char:FindFirstChildOfClass("Humanoid")
-    print("===== PROBE =====")
-    print("Equipped:", tool and tool.Name or "(none)")
-    if tool then
-        for _, c in ipairs(tool:GetChildren()) do
-            print("  tool ->", c.ClassName, "[" .. c.Name .. "]")
-        end
-    end
-    if hum then
-        for _, c in ipairs(hum:GetChildren()) do
-            print("  hum  ->", c.ClassName, "[" .. c.Name .. "]")
-        end
-    end
-    print("==================")
 end
 
 -- ============================================================
@@ -382,12 +307,10 @@ local function runMacroLoop()
                 if kc then
                     local ok = equipWeapon(b.weapon)
                     if ok then
-                        local holdSec = (b.mode == "Hold") and b.holdTime or 0
-                        local fired = fireAbilityRemote(b.ability, holdSec)
-                        if not fired and CompatibilityMode then
-                            sendKeyRaw(kc, true)
-                            task.wait(b.mode == "Hold" and b.holdTime or 0.03)
-                            sendKeyRaw(kc, false)
+                        if b.mode == "Hold" then
+                            holdKey(kc, b.holdTime)
+                        else
+                            tapKey(kc)
                         end
                     end
                 end
@@ -442,7 +365,6 @@ local C_TEXT   = Color3.fromRGB(230, 240, 255)
 local C_MUTED  = Color3.fromRGB(130, 150, 170)
 local C_GREEN  = Color3.fromRGB(0, 255, 160)
 local C_RED    = Color3.fromRGB(255, 80, 80)
-local C_ORANGE = Color3.fromRGB(255, 160, 60)
 
 local function corner(obj, r)
     local c = Instance.new("UICorner")
@@ -518,7 +440,7 @@ local Panel = Instance.new("Frame")
 Panel.Name = "Panel"
 Panel.AnchorPoint = Vector2.new(0.5, 0.5)
 Panel.Position = UDim2.new(0.5, 0, 0.5, 0)
-Panel.Size = UDim2.new(0, 460, 0, 660)
+Panel.Size = UDim2.new(0, 460, 0, 640)
 Panel.BackgroundColor3 = C_BG
 Panel.BorderSizePixel = 0
 Panel.Visible = false
@@ -531,7 +453,7 @@ scale.Parent = Panel
 local function resizeUI()
     local cam = workspace.CurrentCamera
     if not cam then return end
-    scale.Scale = math.clamp(math.min((cam.ViewportSize.X - 20) / 460, (cam.ViewportSize.Y - 30) / 660), 0.6, 1)
+    scale.Scale = math.clamp(math.min((cam.ViewportSize.X - 20) / 460, (cam.ViewportSize.Y - 30) / 640), 0.6, 1)
 end
 resizeUI()
 if workspace.CurrentCamera then
@@ -556,7 +478,7 @@ HTitle.Parent = Header
 
 local HSub = Instance.new("TextLabel")
 HSub.BackgroundTransparency = 1
-HSub.Text = "REMOTE-FIRE v6"
+HSub.Text = "8-BLOCK SEQUENCER"
 HSub.TextColor3 = C_MUTED
 HSub.Font = Enum.Font.GothamBold
 HSub.TextSize = 8
@@ -578,7 +500,6 @@ CloseBtn.Parent = Header
 corner(CloseBtn, 8)
 CloseBtn.MouseButton1Click:Connect(function() Panel.Visible = false end)
 
--- Enable row
 local EnableRow = Instance.new("Frame")
 EnableRow.BackgroundColor3 = C_PANEL
 EnableRow.BorderSizePixel = 0
@@ -621,86 +542,11 @@ EnableToggle.MouseButton1Click:Connect(function()
     saveConfig()
 end)
 
--- Compat row
-local CompatRow = Instance.new("Frame")
-CompatRow.BackgroundColor3 = C_PANEL
-CompatRow.BorderSizePixel = 0
-CompatRow.Position = UDim2.new(0, 14, 0, 114)
-CompatRow.Size = UDim2.new(1, -28, 0, 46)
-CompatRow.Parent = Panel
-corner(CompatRow, 10)
-stroke(CompatRow, C_ORANGE, 0.85)
-
-local CompatLabel = Instance.new("TextLabel")
-CompatLabel.BackgroundTransparency = 1
-CompatLabel.Text = "Compatibility Mode (shifts UI)"
-CompatLabel.TextColor3 = C_ORANGE
-CompatLabel.Font = Enum.Font.GothamBold
-CompatLabel.TextSize = 10
-CompatLabel.TextXAlignment = Enum.TextXAlignment.Left
-CompatLabel.Position = UDim2.new(0, 14, 0, 0)
-CompatLabel.Size = UDim2.new(1, -90, 1, 0)
-CompatLabel.Parent = CompatRow
-
-local CompatToggle = Instance.new("TextButton")
-CompatToggle.AutoButtonColor = false
-CompatToggle.Text = CompatibilityMode and "ON" or "OFF"
-CompatToggle.TextColor3 = CompatibilityMode and C_ORANGE or C_MUTED
-CompatToggle.Font = Enum.Font.GothamBold
-CompatToggle.TextSize = 10
-CompatToggle.BackgroundColor3 = CompatibilityMode and Color3.fromRGB(40, 24, 4) or Color3.fromRGB(20, 20, 30)
-CompatToggle.Position = UDim2.new(1, -62, 0.5, -11)
-CompatToggle.Size = UDim2.new(0, 48, 0, 22)
-CompatToggle.Parent = CompatRow
-corner(CompatToggle, 6)
-
-CompatToggle.MouseButton1Click:Connect(function()
-    CompatibilityMode = not CompatibilityMode
-    CompatToggle.Text = CompatibilityMode and "ON" or "OFF"
-    CompatToggle.TextColor3 = CompatibilityMode and C_ORANGE or C_MUTED
-    CompatToggle.BackgroundColor3 = CompatibilityMode and Color3.fromRGB(40, 24, 4) or Color3.fromRGB(20, 20, 30)
-    saveConfig()
-end)
-
--- Test Fire button
-local TestRow = Instance.new("Frame")
-TestRow.BackgroundColor3 = C_PANEL
-TestRow.BorderSizePixel = 0
-TestRow.Position = UDim2.new(0, 14, 0, 166)
-TestRow.Size = UDim2.new(1, -28, 0, 40)
-TestRow.Parent = Panel
-corner(TestRow, 10)
-stroke(TestRow, C_ACCENT, 0.55)
-
-local TestBtn = Instance.new("TextButton")
-TestBtn.AutoButtonColor = false
-TestBtn.Text = "TEST FIRE (current block abilities)"
-TestBtn.TextColor3 = C_TEXT
-TestBtn.Font = Enum.Font.GothamBold
-TestBtn.TextSize = 10
-TestBtn.BackgroundTransparency = 1
-TestBtn.Size = UDim2.new(1, 0, 1, 0)
-TestBtn.Parent = TestRow
-TestBtn.MouseButton1Click:Connect(function()
-    local fired = 0
-    for i = 1, 8 do
-        local b = Blocks[i]
-        if b.enabled then
-            task.spawn(function()
-                equipWeapon(b.weapon)
-                testFire(b.ability)
-            end)
-            fired = fired + 1
-        end
-    end
-    print("[ProdigyMacro] test fired on", fired, "blocks")
-end)
-
 local BlockScroll = Instance.new("ScrollingFrame")
 BlockScroll.BackgroundTransparency = 1
 BlockScroll.BorderSizePixel = 0
-BlockScroll.Position = UDim2.new(0, 14, 0, 216)
-BlockScroll.Size = UDim2.new(1, -28, 1, -230)
+BlockScroll.Position = UDim2.new(0, 14, 0, 118)
+BlockScroll.Size = UDim2.new(1, -28, 1, -132)
 BlockScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
 BlockScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
 BlockScroll.ScrollBarThickness = 4
@@ -1008,10 +854,5 @@ do
     end)
 end
 
-_G.ProdigyMacroProbe = probeCurrentTool
-_G.ProdigyMacroTestFire = testFire
-
 updateFloatingVisual()
-print("[ProdigyMacro] v6 loaded — Cobalt-shape remote fire")
-print("[ProdigyMacro] _G.ProdigyMacroProbe() to dump remotes")
-print("[ProdigyMacro] _G.ProdigyMacroTestFire('Z') to test single ability")
+print("[ProdigyMacro] v7 loaded — v3 keys + UI-shift suppression (3 layers)")
