@@ -1,7 +1,8 @@
 -- ============================================================
--- PRODIGY MACRO — Standalone Build v3
--- 8-block sequential macro. Auto-equip per block category.
--- PC-keyboard UI suppressor while running.
+-- PRODIGY MACRO — Standalone Build v5
+-- Remote-fire ONLY. No SendKeyEvent. No UI shift possible.
+-- If a tool's remote can't be found, block skips (optionally
+-- falls back to keys when Compatibility Mode is ON).
 -- ============================================================
 
 local Players = game:GetService("Players")
@@ -36,6 +37,7 @@ local KEY_MAP = {
 local MacroEnabled = false
 local MacroRunning = false
 local MacroThread = nil
+local CompatibilityMode = false  -- when true, key fallback allowed (shifts UI)
 
 local Blocks = {}
 for i = 1, 8 do
@@ -52,7 +54,7 @@ end
 -- PERSISTENCE
 -- ============================================================
 local function saveConfig()
-    local data = { enabled = MacroEnabled, blocks = {} }
+    local data = { enabled = MacroEnabled, compat = CompatibilityMode, blocks = {} }
     for i, b in ipairs(Blocks) do data.blocks[i] = b end
     pcall(function()
         if writefile then
@@ -67,6 +69,7 @@ local function loadConfig()
         local data = HttpService:JSONDecode(readfile(CONFIG_FILE))
         if type(data) ~= "table" then return end
         if data.enabled ~= nil then MacroEnabled = data.enabled == true end
+        if data.compat ~= nil then CompatibilityMode = data.compat == true end
         if type(data.blocks) ~= "table" then return end
         for i = 1, math.min(8, #data.blocks) do
             local b = data.blocks[i]
@@ -88,31 +91,154 @@ end
 loadConfig()
 
 -- ============================================================
--- EXECUTION
+-- ABILITY FIRING — REMOTE ONLY
 -- ============================================================
-local function sendKey(keyCode, down)
+local function sendKeyRaw(keyCode, down)
+    -- Only used in compatibility fallback. Never called otherwise.
     if not VirtualInputManager then return end
     pcall(function()
         VirtualInputManager:SendKeyEvent(down, keyCode, false, game)
     end)
 end
 
-local function tapKey(keyCode)
-    sendKey(keyCode, true)
-    task.wait(0.03)
-    sendKey(keyCode, false)
-end
-
-local function holdKey(keyCode, duration)
-    sendKey(keyCode, true)
-    task.wait(duration)
-    sendKey(keyCode, false)
-end
-
 local function releaseAllKeys()
-    for _, kc in pairs(KEY_MAP) do
-        sendKey(kc, false)
+    -- No-op in pure remote mode. Kept for compat cleanup.
+    if not CompatibilityMode then return end
+    for _, kc in pairs(KEY_MAP) do sendKeyRaw(kc, false) end
+end
+
+-- ---- Remote discovery ----
+local REMOTE_NAMES = {
+    "RemoteEvent", "", "Remote", "AbilityRemote", "CommE",
+    "Skill", "Attack", "Use", "Server", "Event", "Fire"
+}
+
+local function findRemoteIn(container)
+    if not container then return nil end
+    -- named first
+    for _, name in ipairs(REMOTE_NAMES) do
+        local child = container:FindFirstChild(name)
+        if child and (child:IsA("RemoteEvent") or child:IsA("RemoteFunction")) then
+            return child
+        end
     end
+    -- any remote child
+    for _, child in ipairs(container:GetChildren()) do
+        if child:IsA("RemoteEvent") or child:IsA("RemoteFunction") then
+            return child
+        end
+    end
+    -- one level deep (some tools nest under a Folder)
+    for _, child in ipairs(container:GetChildren()) do
+        if child:IsA("Folder") or child:IsA("Model") then
+            for _, sub in ipairs(child:GetChildren()) do
+                if sub:IsA("RemoteEvent") or sub:IsA("RemoteFunction") then
+                    return sub
+                end
+            end
+        end
+    end
+    return nil
+end
+
+-- Tries multiple payload shapes for a given remote + key.
+local function tryFire(remote, abilityKey)
+    local char = player.Character
+    if not char then return false end
+    local myRoot = char:FindFirstChild("HumanoidRootPart")
+    local targetPart = _G.currentSilentAimTarget
+    local targetRoot = targetPart and targetPart.Parent
+        and targetPart.Parent:FindFirstChild("HumanoidRootPart")
+    local pos = myRoot and myRoot.Position or Vector3.zero
+
+    local attempts = {
+        -- Fruit style: just the key
+        {abilityKey},
+        -- Combat/Sword style: key + position + target
+        {abilityKey, pos, targetRoot},
+        -- Some fruits want the target only
+        {abilityKey, targetRoot},
+        -- Some want position only
+        {abilityKey, pos},
+    }
+
+    for _, args in ipairs(attempts) do
+        -- strip trailing nil
+        while #args > 0 and args[#args] == nil do
+            table.remove(args)
+        end
+        local ok = pcall(function()
+            if remote:IsA("RemoteFunction") then
+                remote:InvokeServer(unpack(args))
+            else
+                remote:FireServer(unpack(args))
+            end
+        end)
+        if ok then return true end
+    end
+    return false
+end
+
+local function fireAbilityRemote(abilityKey, holdSeconds)
+    local char = player.Character
+    if not char then return false end
+
+    -- 1. Try tool remote
+    local tool = char:FindFirstChildOfClass("Tool")
+    if tool then
+        local r = findRemoteIn(tool)
+        if r then
+            if tryFire(r, abilityKey) then
+                if holdSeconds and holdSeconds > 0 then
+                    task.wait(holdSeconds)
+                    pcall(function() r:FireServer(abilityKey, false) end)
+                end
+                return true
+            end
+        end
+    end
+
+    -- 2. Try humanoid remote (Combat / sword abilities)
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if hum then
+        local r = findRemoteIn(hum)
+        if r then
+            if tryFire(r, abilityKey) then
+                if holdSeconds and holdSeconds > 0 then
+                    task.wait(holdSeconds)
+                    pcall(function() r:FireServer(abilityKey, false) end)
+                end
+                return true
+            end
+        end
+    end
+
+    return false
+end
+
+-- Diagnostics — prints all remotes on current tool + humanoid
+local function probeCurrentTool()
+    local char = player.Character
+    if not char then
+        print("[Probe] No character")
+        return
+    end
+    local tool = char:FindFirstChildOfClass("Tool")
+    local hum  = char:FindFirstChildOfClass("Humanoid")
+    print("===== TOOL PROBE =====")
+    print("Equipped:", tool and tool.Name or "(none)")
+    if tool then
+        for _, c in ipairs(tool:GetChildren()) do
+            print("  tool ->", c.ClassName, c.Name)
+        end
+    end
+    print("Humanoid:")
+    if hum then
+        for _, c in ipairs(hum:GetChildren()) do
+            print("  hum ->", c.ClassName, c.Name)
+        end
+    end
+    print("======================")
 end
 
 -- ============================================================
@@ -149,23 +275,17 @@ end
 
 local function detectToolCategory(tool)
     if not tool or not tool:IsA("Tool") then return nil end
-
     local name = string.lower(tool.Name)
     local tip = ""
     pcall(function() tip = string.lower(tool.ToolTip or "") end)
-
     local hasFruitChild = tool:FindFirstChild("Fruit") ~= nil
     local hasSwordChild = tool:FindFirstChild("Sword") ~= nil
     local hasGunChild   = tool:FindFirstChild("Gun")   ~= nil
 
-    if hasFruitChild or tip:find("blox fruit") or tip:find("fruit") then
-        return "Fruit"
-    end
+    if hasFruitChild or tip:find("blox fruit") or tip:find("fruit") then return "Fruit" end
     if name:find("-") then
         local a, b = name:match("^([%w%s]+)%-(%w+)$")
-        if a and b and (a:find(b) or b:find(a)) then
-            return "Fruit"
-        end
+        if a and b and (a:find(b) or b:find(a)) then return "Fruit" end
     end
     for _, kw in ipairs(FRUIT_KEYWORDS) do
         if name:find(kw, 1, true) then
@@ -175,19 +295,10 @@ local function detectToolCategory(tool)
             break
         end
     end
-
-    if hasSwordChild or tip:find("sword") or matchesAny(name, SWORD_KEYWORDS) then
-        return "Sword"
-    end
-    if hasGunChild or tip:find("gun") or matchesAny(name, GUN_KEYWORDS) then
-        return "Gun"
-    end
-    if matchesAny(name, MELEE_KEYWORDS) then
-        return "Melee"
-    end
-    if not hasFruitChild and not hasSwordChild and not hasGunChild then
-        return "Melee"
-    end
+    if hasSwordChild or tip:find("sword") or matchesAny(name, SWORD_KEYWORDS) then return "Sword" end
+    if hasGunChild or tip:find("gun") or matchesAny(name, GUN_KEYWORDS) then return "Gun" end
+    if matchesAny(name, MELEE_KEYWORDS) then return "Melee" end
+    if not hasFruitChild and not hasSwordChild and not hasGunChild then return "Melee" end
     return nil
 end
 
@@ -212,53 +323,14 @@ local function equipWeapon(weapon)
     if not char then return false end
     local hum = char:FindFirstChildOfClass("Humanoid")
     if not hum then return false end
-
     local current = char:FindFirstChildOfClass("Tool")
-    if current and detectToolCategory(current) == weapon then
-        return true
-    end
-
+    if current and detectToolCategory(current) == weapon then return true end
     local tool = findToolForWeapon(weapon)
     if not tool then return false end
-
     pcall(function() hum:EquipTool(tool) end)
     task.wait(0.10)
     return true
 end
-
--- ============================================================
--- PC-UI SUPPRESSOR
--- Blox Fruits swaps to a keyboard-hint overlay when it detects
--- virtual keyboard events. Hide that panel while macro runs.
--- ============================================================
-local function looksLikeKeyHint(text)
-    if not text or text == "" then return false end
-    if text:find("%[[ZzXxCcVvFfM1m1]%]") then return true end
-    if text:find("^Use ") then return true end
-    return false
-end
-
-local function hideKeyHintUI()
-    if not MacroRunning then return end
-    local pg = player:FindFirstChild("PlayerGui")
-    if not pg then return end
-    for _, obj in ipairs(pg:GetDescendants()) do
-        if obj:IsA("TextLabel") and obj.Visible and looksLikeKeyHint(obj.Text) then
-            local frame = obj
-            while frame.Parent and frame.Parent ~= pg do
-                if frame:IsA("Frame") then
-                    frame.Visible = false
-                    break
-                end
-                frame = frame.Parent
-            end
-        end
-    end
-end
-
-RunService.RenderStepped:Connect(function()
-    pcall(hideKeyHintUI)
-end)
 
 -- ============================================================
 -- MACRO LOOP
@@ -273,10 +345,13 @@ local function runMacroLoop()
                 if kc then
                     local ok = equipWeapon(b.weapon)
                     if ok then
-                        if b.mode == "Hold" then
-                            holdKey(kc, b.holdTime)
-                        else
-                            tapKey(kc)
+                        local holdSec = (b.mode == "Hold") and b.holdTime or 0
+                        local fired = fireAbilityRemote(b.ability, holdSec)
+                        if not fired and CompatibilityMode then
+                            -- explicit opt-in fallback; will shift UI
+                            sendKeyRaw(kc, true)
+                            task.wait(b.mode == "Hold" and b.holdTime or 0.03)
+                            sendKeyRaw(kc, false)
                         end
                     end
                 end
@@ -331,6 +406,7 @@ local C_TEXT   = Color3.fromRGB(230, 240, 255)
 local C_MUTED  = Color3.fromRGB(130, 150, 170)
 local C_GREEN  = Color3.fromRGB(0, 255, 160)
 local C_RED    = Color3.fromRGB(255, 80, 80)
+local C_ORANGE = Color3.fromRGB(255, 160, 60)
 
 local function corner(obj, r)
     local c = Instance.new("UICorner")
@@ -348,7 +424,7 @@ local function stroke(obj, col, trans)
 end
 
 -- ============================================================
--- FLOATING START/STOP + GEAR
+-- FLOATING BUTTON
 -- ============================================================
 local Floating = Instance.new("TextButton")
 Floating.Name = "Floating"
@@ -448,7 +524,7 @@ HTitle.Parent = Header
 
 local HSub = Instance.new("TextLabel")
 HSub.BackgroundTransparency = 1
-HSub.Text = "8-BLOCK SEQUENCER"
+HSub.Text = "REMOTE-FIRE MODE"
 HSub.TextColor3 = C_MUTED
 HSub.Font = Enum.Font.GothamBold
 HSub.TextSize = 8
@@ -470,6 +546,7 @@ CloseBtn.Parent = Header
 corner(CloseBtn, 8)
 CloseBtn.MouseButton1Click:Connect(function() Panel.Visible = false end)
 
+-- Enable row
 local EnableRow = Instance.new("Frame")
 EnableRow.BackgroundColor3 = C_PANEL
 EnableRow.BorderSizePixel = 0
@@ -512,11 +589,52 @@ EnableToggle.MouseButton1Click:Connect(function()
     saveConfig()
 end)
 
+-- Compat row
+local CompatRow = Instance.new("Frame")
+CompatRow.BackgroundColor3 = C_PANEL
+CompatRow.BorderSizePixel = 0
+CompatRow.Position = UDim2.new(0, 14, 0, 114)
+CompatRow.Size = UDim2.new(1, -28, 0, 46)
+CompatRow.Parent = Panel
+corner(CompatRow, 10)
+stroke(CompatRow, C_ORANGE, 0.85)
+
+local CompatLabel = Instance.new("TextLabel")
+CompatLabel.BackgroundTransparency = 1
+CompatLabel.Text = "Compatibility Mode (shifts UI)"
+CompatLabel.TextColor3 = C_ORANGE
+CompatLabel.Font = Enum.Font.GothamBold
+CompatLabel.TextSize = 10
+CompatLabel.TextXAlignment = Enum.TextXAlignment.Left
+CompatLabel.Position = UDim2.new(0, 14, 0, 0)
+CompatLabel.Size = UDim2.new(1, -90, 1, 0)
+CompatLabel.Parent = CompatRow
+
+local CompatToggle = Instance.new("TextButton")
+CompatToggle.AutoButtonColor = false
+CompatToggle.Text = CompatibilityMode and "ON" or "OFF"
+CompatToggle.TextColor3 = CompatibilityMode and C_ORANGE or C_MUTED
+CompatToggle.Font = Enum.Font.GothamBold
+CompatToggle.TextSize = 10
+CompatToggle.BackgroundColor3 = CompatibilityMode and Color3.fromRGB(40, 24, 4) or Color3.fromRGB(20, 20, 30)
+CompatToggle.Position = UDim2.new(1, -62, 0.5, -11)
+CompatToggle.Size = UDim2.new(0, 48, 0, 22)
+CompatToggle.Parent = CompatRow
+corner(CompatToggle, 6)
+
+CompatToggle.MouseButton1Click:Connect(function()
+    CompatibilityMode = not CompatibilityMode
+    CompatToggle.Text = CompatibilityMode and "ON" or "OFF"
+    CompatToggle.TextColor3 = CompatibilityMode and C_ORANGE or C_MUTED
+    CompatToggle.BackgroundColor3 = CompatibilityMode and Color3.fromRGB(40, 24, 4) or Color3.fromRGB(20, 20, 30)
+    saveConfig()
+end)
+
 local BlockScroll = Instance.new("ScrollingFrame")
 BlockScroll.BackgroundTransparency = 1
 BlockScroll.BorderSizePixel = 0
-BlockScroll.Position = UDim2.new(0, 14, 0, 118)
-BlockScroll.Size = UDim2.new(1, -28, 1, -132)
+BlockScroll.Position = UDim2.new(0, 14, 0, 170)
+BlockScroll.Size = UDim2.new(1, -28, 1, -184)
 BlockScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
 BlockScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
 BlockScroll.ScrollBarThickness = 4
@@ -824,5 +942,9 @@ do
     end)
 end
 
+-- Expose probe for manual testing
+_G.ProdigyMacroProbe = probeCurrentTool
+
 updateFloatingVisual()
-print("[ProdigyMacro] v3 loaded — auto-equip + PC-UI suppressor active")
+print("[ProdigyMacro] v5 loaded — remote-fire only, no UI shift")
+print("[ProdigyMacro] run _G.ProdigyMacroProbe() to dump remotes on equipped tool")
