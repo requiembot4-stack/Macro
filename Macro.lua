@@ -1,6 +1,6 @@
 -- ============================================================
--- PRODIGY MACRO — Standalone Build v8
--- Aggressive input-type spoof: property reads + event signal.
+-- PRODIGY MACRO — Standalone Build v9
+-- v3 flow + UIS metatable hook. No mouse bounce.
 -- ============================================================
 
 local Players = game:GetService("Players")
@@ -17,7 +17,7 @@ local CONFIG_FILE = "ProdigyMacro_Config.json"
 local INTER_BLOCK_DELAY = 0.05
 
 -- ============================================================
--- UI-SHIFT SUPPRESSION
+-- UI-SHIFT SUPPRESSION (metatable hook only)
 -- ============================================================
 local UIS_HOOK_OK = false
 
@@ -29,16 +29,13 @@ do
             local oldIndex = mt.__index
             local oldNewIndex = mt.__newindex
 
-            -- fake signal that swallows every Connect
-            local FakeEvent = Instance.new("BindableEvent")
-            local FakeSignal = {
-                Connect = function(_, fn)
-                    -- return a dead connection object
-                    return { Disconnect = function() end }
-                end,
-                Wait = function() task.wait(9e9) end,
-            }
-            setmetatable(FakeSignal, { __index = function() return function() end end })
+            local FakeSignal = setmetatable({}, {
+                __index = function()
+                    return function()
+                        return { Disconnect = function() end }
+                    end
+                end
+            })
 
             mt.__index = function(self, key)
                 if key == "GetLastInputType" then
@@ -62,7 +59,6 @@ do
 
             if oldNewIndex then
                 mt.__newindex = function(self, key, value)
-                    -- block anything trying to write enabled-state
                     if key == "KeyboardEnabled" or key == "MouseEnabled" then
                         return
                     end
@@ -76,20 +72,7 @@ do
     end
 end
 
-print("[v8] UIS metatable hook:", UIS_HOOK_OK and "OK" or "FAILED")
-
--- ============================================================
--- Post-key nudge: bounce engine back to non-keyboard immediately
--- ============================================================
-local function flipBackToNonKeyboard()
-    if not VirtualInputManager then return end
-    pcall(function()
-        VirtualInputManager:SendMouseButtonEvent(0, 0, 0, true, game, 1)
-    end)
-    pcall(function()
-        VirtualInputManager:SendMouseButtonEvent(0, 0, 0, false, game, 1)
-    end)
-end
+print("[v9] UIS metatable hook:", UIS_HOOK_OK and "OK" or "FAILED")
 
 -- ============================================================
 -- Hide any desktop panel that still slips through
@@ -206,7 +189,7 @@ end
 loadConfig()
 
 -- ============================================================
--- EXECUTION
+-- EXECUTION — virtual keys, no mouse bounce
 -- ============================================================
 local function sendKey(keyCode, down)
     if not VirtualInputManager then return end
@@ -219,14 +202,12 @@ local function tapKey(keyCode)
     sendKey(keyCode, true)
     task.wait(0.03)
     sendKey(keyCode, false)
-    flipBackToNonKeyboard()
 end
 
 local function holdKey(keyCode, duration)
     sendKey(keyCode, true)
     task.wait(duration)
     sendKey(keyCode, false)
-    flipBackToNonKeyboard()
 end
 
 local function releaseAllKeys()
@@ -875,4 +856,4 @@ do
 end
 
 updateFloatingVisual()
-print("[ProdigyMacro] v8 loaded — aggressive UIS hook")
+print("[ProdigyMacro] v9 loaded — UIS hook only, no mouse bounce")
